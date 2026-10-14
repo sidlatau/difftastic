@@ -86,6 +86,7 @@ pub(crate) struct TreeSitterConfig {
 type TreeSitterNodeName = &'static str;
 
 extern "C" {
+    fn tree_sitter_dart() -> ts::Language;
     fn tree_sitter_janet_simple() -> ts::Language;
     fn tree_sitter_kotlin() -> ts::Language;
     fn tree_sitter_latex() -> ts::Language;
@@ -321,8 +322,7 @@ fn build_config(language: guess::Language) -> TreeSitterConfig {
             }
         }
         Dart => {
-            let language_fn = tree_sitter_dart_orchard::LANGUAGE;
-            let language = tree_sitter::Language::new(language_fn);
+            let language = unsafe { tree_sitter_dart() };
             TreeSitterConfig {
                 language: language.clone(),
                 atom_nodes: ["string_literal", "script_tag"].into_iter().collect(),
@@ -330,7 +330,7 @@ fn build_config(language: guess::Language) -> TreeSitterConfig {
                 ignore_trailing_tokens: vec![],
                 highlight_query: ts::Query::new(
                     &language,
-                    tree_sitter_dart_orchard::HIGHLIGHTS_QUERY,
+                    include_str!("../../vendored_parsers/highlights/dart.scm"),
                 )
                 .unwrap(),
                 sub_languages: vec![],
