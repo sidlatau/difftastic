@@ -315,7 +315,7 @@ fn highlight_positions(
     (lhs_styles, rhs_styles)
 }
 
-fn highlight_as_novel(
+pub(crate) fn highlight_as_novel(
     line_num: Option<LineNumber>,
     lines: &[&str],
     opposite_line_num: Option<LineNumber>,
@@ -437,7 +437,7 @@ fn visible_content_max_display_width(
 /// all (a pure deletion with no surrounding new context) falls back to the
 /// position the next new line would occupy, mirroring the deletion convention
 /// in `left_cell`.
-fn hunk_first_new_line(
+pub(crate) fn hunk_first_new_line(
     aligned_lines: &[(Option<LineNumber>, Option<LineNumber>)],
     prev_rhs: Option<LineNumber>,
 ) -> usize {

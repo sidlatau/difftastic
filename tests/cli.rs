@@ -57,13 +57,41 @@ fn inline_unchanged_lines_between_changes() {
         .arg("sample_files/cli_tests/gitconfig_1.gitconfig")
         .arg("sample_files/cli_tests/gitconfig_2.gitconfig");
 
-    let url_rx = r#"(?m)^\s*7\s+\[url "ssh://git@github\.com"\]$"#;
-    let url_lines = predicate::str::is_match(url_rx).unwrap().count(2);
+    let url_rx = r#"(?m)^\s*7\s+7\s+\[url "ssh://git@github\.com"\]$"#;
+    let url_lines = predicate::str::is_match(url_rx).unwrap().count(1);
 
-    let blank_rx = r"(?m)^\s*6\s*$";
-    let blank_lines = predicate::str::is_match(blank_rx).unwrap().count(2);
+    let blank_rx = r"(?m)^\s*6\s+6\s*$";
+    let blank_lines = predicate::str::is_match(blank_rx).unwrap().count(1);
 
     cmd.assert().stdout(url_lines.and(blank_lines));
+}
+
+#[test]
+fn inline_changed_lines_grouped() {
+    let mut cmd = get_base_command();
+
+    cmd.arg("--display=inline")
+        .arg("sample_files/cli_tests/gitconfig_1.gitconfig")
+        .arg("sample_files/cli_tests/gitconfig_2.gitconfig");
+
+    let change_rx = r"(?m)^\s*5\s+editor = vim\n\s+5\s+editor = emacs\n\s*6\s+6\s*\n\s*7\s+7\s";
+    let change = predicate::str::is_match(change_rx).unwrap();
+
+    cmd.assert().stdout(change);
+}
+
+#[test]
+fn inline_added_file_has_no_old_line() {
+    let mut cmd = get_base_command();
+
+    cmd.arg("--display=inline")
+        .arg("/dev/null")
+        .arg("sample_files/cli_tests/gitconfig_1.gitconfig");
+
+    let old_line_rx = r"(?m)^\s*1\s*$";
+    let old_line = predicate::str::is_match(old_line_rx).unwrap().count(0);
+
+    cmd.assert().stdout(old_line);
 }
 
 #[test]

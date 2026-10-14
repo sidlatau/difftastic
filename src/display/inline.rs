@@ -3,11 +3,10 @@
 use line_numbers::LineNumber;
 
 use crate::constants::Side;
-use crate::display::context::{
-    calculate_after_context, calculate_before_context, opposite_positions,
-};
+use crate::display::context::all_matched_lines_filled;
 use crate::display::diff_line_metadata::{row_is_novel, DiffLineMetadata};
-use crate::display::hunks::{extract_lines, Hunk};
+use crate::display::hunks::{matched_lines_indexes_for_hunk, Hunk};
+use crate::display::side_by_side::{highlight_as_novel, hunk_first_new_line, lines_with_novel};
 use crate::display::style::{self, apply_colors, apply_line_number_color};
 use crate::lines::{format_line_num, format_line_num_padded, split_on_newlines, MaxLine};
 use crate::options::DisplayOptions;
@@ -64,36 +63,58 @@ pub(crate) fn print(
         .map(|line| style::replace_tabs(&line, display_options.tab_width))
         .collect();
 
-    let opposite_to_lhs = opposite_positions(lhs_mps);
-    let opposite_to_rhs = opposite_positions(rhs_mps);
-
     let metadata = DiffLineMetadata::from_env(display_path);
-    let lhs_lines: Vec<&str> = split_on_newlines(lhs_src).collect();
-    let rhs_lines: Vec<&str> = split_on_newlines(rhs_src).collect();
 
-    // Calculate the maximum line number width for alignment and context.
-    let lhs_max_line = lhs_src.max_line();
-    let rhs_max_line = rhs_src.max_line();
-    let lhs_line_nums_width = format_line_num(lhs_max_line).len();
-    let rhs_line_nums_width = format_line_num(rhs_max_line).len();
+    let mut lhs_lines: Vec<&str> = split_on_newlines(lhs_src).collect();
+    let mut rhs_lines: Vec<&str> = split_on_newlines(rhs_src).collect();
+    if lhs_lines.last() == Some(&"") && lhs_lines.len() > 1 {
+        lhs_lines.pop();
+    }
+    if rhs_lines.last() == Some(&"") && rhs_lines.len() > 1 {
+        rhs_lines.pop();
+    }
+
+    let (lhs_lines_with_novel, rhs_lines_with_novel) = lines_with_novel(lhs_mps, rhs_mps);
+    let matched_lines = all_matched_lines_filled(lhs_mps, rhs_mps, &lhs_lines, &rhs_lines);
+    let mut matched_lines_to_print = &matched_lines[..];
+
+    let lhs_line_nums_width = format_line_num(lhs_src.max_line()).len();
+    let rhs_line_nums_width = format_line_num(rhs_src.max_line()).len();
+
+    // Every row has both line-number columns, blank where that side has no
+    // line, so the content starts in the same column on every row.
+    let gutter = |lhs: Option<(LineNumber, bool)>, rhs: Option<(LineNumber, bool)>| {
+        let lhs = match lhs {
+            Some((line_num, is_novel)) => apply_line_number_color(
+                &format_line_num_padded(line_num, lhs_line_nums_width),
+                is_novel,
+                Side::Left,
+                display_options,
+            ),
+            None => " ".repeat(lhs_line_nums_width),
+        };
+        let rhs = match rhs {
+            Some((line_num, is_novel)) => apply_line_number_color(
+                &format_line_num_padded(line_num, rhs_line_nums_width),
+                is_novel,
+                Side::Right,
+                display_options,
+            ),
+            None => " ".repeat(rhs_line_nums_width),
+        };
+        format!("{}{}", lhs, rhs)
+    };
+
+    let mut prev_rhs: Option<LineNumber> = None;
 
     for (i, hunk) in hunks.iter().enumerate() {
-        let hunk_lines = extract_lines(hunk);
-
-        let before_lines = calculate_before_context(
-            &hunk_lines,
-            &opposite_to_lhs,
-            &opposite_to_rhs,
+        let (start_i, end_i) = matched_lines_indexes_for_hunk(
+            matched_lines_to_print,
+            hunk,
             display_options.num_context_lines as usize,
         );
-        let after_lines = calculate_after_context(
-            &[&before_lines[..], &hunk_lines[..]].concat(),
-            &opposite_to_lhs,
-            &opposite_to_rhs,
-            lhs_max_line,
-            rhs_max_line,
-            display_options.num_context_lines as usize,
-        );
+        let aligned_lines = &matched_lines_to_print[start_i..end_i];
+        matched_lines_to_print = &matched_lines_to_print[start_i..];
 
         let banner = style::header(
             display_path,
@@ -108,143 +129,102 @@ pub(crate) fn print(
             // carries the hunk's `h` (with the hunk's first new-file line), and
             // the first hunk's banner additionally carries the file's `f`.
             Some(metadata) => {
-                let new_line = before_lines
-                    .iter()
-                    .chain(hunk_lines.iter())
-                    .chain(after_lines.iter())
-                    .find_map(|(_, rhs)| rhs.map(|n| n.as_usize() + 1))
-                    .unwrap_or(1);
+                let new_line = if rhs_src.is_empty() {
+                    0
+                } else {
+                    hunk_first_new_line(aligned_lines, prev_rhs)
+                };
                 println!("{}", metadata.header_banner(i == 0, new_line, &banner));
             }
             None => println!("{}", banner),
         }
 
-        // Inline mode groups all old-side content (before-context, then
-        // deletions) before all new-side content (additions, then
-        // after-context). The metadata rides each line: the old-side passes
-        // emit the left-column record, the new-side passes the right-column
-        // one, so a host can still reconstruct each line's identity despite the
-        // grouping. `prev_rhs` carries the most recent new-file line through the
-        // old-side passes, to place a pure deletion (which has no new line of
-        // its own) at the following new-file position.
-        let mut prev_rhs: Option<LineNumber> = None;
+        // Rows come aligned as in side-by-side display. An unchanged row
+        // prints once; a run of changed rows prints all its old lines, then
+        // all its new lines, like a unified diff.
+        let mut removed: Vec<String> = vec![];
+        let mut added: Vec<String> = vec![];
 
-        for (lhs_line, rhs_line) in before_lines {
-            if let Some(lhs_line) = lhs_line {
-                if let Some(metadata) = &metadata {
-                    // An old line with no new-side counterpart is a deletion in
-                    // patch space even when this display files it under context
-                    // (a deleted blank line, or a line consumed by a join). An
-                    // aligned context row stays `c` even if its sides' contents
-                    // differ (a whitespace-only change): only one side of it is
-                    // ever rendered here, so a `d` would hand the host a
-                    // deletion whose addition it can never show.
-                    print!(
-                        "{}",
-                        metadata.left_cell(Some(lhs_line), rhs_line, rhs_line.is_none(), prev_rhs,)
-                    );
-                }
-                print!(
-                    "{}   {}",
-                    apply_line_number_color(
-                        &format_line_num_padded(lhs_line, lhs_line_nums_width),
-                        false,
-                        Side::Left,
-                        display_options,
-                    ),
-                    lhs_colored_lines[lhs_line.as_usize()]
-                );
-            }
-            if let Some(rhs_line) = rhs_line {
-                prev_rhs = Some(rhs_line);
-            }
-        }
+        for &(lhs_line, rhs_line) in aligned_lines {
+            // An empty file still has one (empty) line to align against,
+            // which is not content to show.
+            let lhs_line = lhs_line.filter(|_| !lhs_src.is_empty());
+            let rhs_line = rhs_line.filter(|_| !rhs_src.is_empty());
 
-        for (lhs_line, rhs_line) in &hunk_lines {
-            if let Some(lhs_line) = lhs_line {
-                if let Some(metadata) = &metadata {
-                    // The line type is the row's patch-space type (contents
-                    // compared -- see row_is_novel), not the token novelty the
-                    // display colors by: a line changed only by added tokens
-                    // has no novel old-side tokens, yet its old line is still
-                    // the deletion half of the modification. A genuinely
-                    // identical line that falls inside the hunk still compares
-                    // equal and is tagged c.
-                    print!(
-                        "{}",
-                        metadata.left_cell(
-                            Some(*lhs_line),
-                            *rhs_line,
-                            row_is_novel(Some(*lhs_line), *rhs_line, &lhs_lines, &rhs_lines),
-                            prev_rhs,
-                        )
-                    );
-                }
-                let is_novel = hunk.novel_lhs.contains(lhs_line);
-                print!(
-                    "{}   {}",
-                    apply_line_number_color(
-                        &format_line_num_padded(*lhs_line, lhs_line_nums_width),
-                        is_novel,
-                        Side::Left,
-                        display_options,
-                    ),
-                    lhs_colored_lines[lhs_line.as_usize()]
-                );
-            }
-            if let Some(rhs_line) = rhs_line {
-                prev_rhs = Some(*rhs_line);
-            }
-        }
-        for (lhs_line, rhs_line) in &hunk_lines {
-            if let Some(rhs_line) = rhs_line {
-                if let Some(metadata) = &metadata {
-                    print!(
-                        "{}",
-                        metadata.right_cell(
-                            Some(*rhs_line),
-                            row_is_novel(*lhs_line, Some(*rhs_line), &lhs_lines, &rhs_lines),
-                        )
-                    );
-                }
-                let is_novel = hunk.novel_rhs.contains(rhs_line);
-                print!(
-                    "   {}{}",
-                    apply_line_number_color(
-                        &format_line_num_padded(*rhs_line, rhs_line_nums_width),
-                        is_novel,
-                        Side::Right,
-                        display_options,
-                    ),
-                    rhs_colored_lines[rhs_line.as_usize()]
-                );
-            }
-        }
+            let lhs_novel =
+                highlight_as_novel(lhs_line, &lhs_lines, rhs_line, &lhs_lines_with_novel);
+            let rhs_novel =
+                highlight_as_novel(rhs_line, &rhs_lines, lhs_line, &rhs_lines_with_novel);
 
-        for (lhs_line, rhs_line) in &after_lines {
-            if let Some(rhs_line) = rhs_line {
-                if let Some(metadata) = &metadata {
-                    // Mirror of the before-context pass: a new line with no
-                    // old-side counterpart is an addition even when filed under
-                    // context; an aligned context row stays `c` regardless of
-                    // content.
+            // The line type is the row's patch-space type (contents compared
+            // -- see row_is_novel), not the token novelty the display colors
+            // by: a line changed only by added tokens has no novel old-side
+            // tokens, yet its old line is still the deletion half of the
+            // modification.
+            let (lhs_osc, rhs_osc) = match &metadata {
+                Some(metadata) => {
+                    let row_novel = row_is_novel(lhs_line, rhs_line, &lhs_lines, &rhs_lines);
+                    // A deleted file has no new-file content, so its
+                    // deletions sit at new-line 0, as in single-column display.
+                    let lhs_osc = match lhs_line {
+                        Some(lhs_line) if rhs_src.is_empty() => {
+                            metadata.single_column_cell(Side::Left, lhs_line.as_usize())
+                        }
+                        _ => metadata.left_cell(lhs_line, rhs_line, row_novel, prev_rhs),
+                    };
+                    (lhs_osc, metadata.right_cell(rhs_line, row_novel))
+                }
+                None => (String::new(), String::new()),
+            };
+
+            match (lhs_line, rhs_line) {
+                (Some(lhs_line), Some(rhs_line)) if !lhs_novel && !rhs_novel => {
+                    print_change(&mut removed, &mut added);
+                    // A row whose sides differ only in whitespace prints its
+                    // new line but still carries its d and a records.
+                    let row_oscs = if lhs_osc == rhs_osc {
+                        lhs_osc
+                    } else {
+                        format!("{}{}", lhs_osc, rhs_osc)
+                    };
                     print!(
-                        "{}",
-                        metadata.right_cell(Some(*rhs_line), lhs_line.is_none())
+                        "{}{}{}",
+                        row_oscs,
+                        gutter(Some((lhs_line, false)), Some((rhs_line, false))),
+                        rhs_colored_lines[rhs_line.as_usize()]
                     );
                 }
-                print!(
-                    "   {}{}",
-                    apply_line_number_color(
-                        &format_line_num_padded(*rhs_line, rhs_line_nums_width),
-                        false,
-                        Side::Right,
-                        display_options,
-                    ),
-                    rhs_colored_lines[rhs_line.as_usize()]
-                );
+                _ => {
+                    if let Some(lhs_line) = lhs_line {
+                        removed.push(format!(
+                            "{}{}{}",
+                            lhs_osc,
+                            gutter(Some((lhs_line, lhs_novel)), None),
+                            lhs_colored_lines[lhs_line.as_usize()]
+                        ));
+                    }
+                    if let Some(rhs_line) = rhs_line {
+                        added.push(format!(
+                            "{}{}{}",
+                            rhs_osc,
+                            gutter(None, Some((rhs_line, rhs_novel))),
+                            rhs_colored_lines[rhs_line.as_usize()]
+                        ));
+                    }
+                }
+            }
+
+            if rhs_line.is_some() {
+                prev_rhs = rhs_line;
             }
         }
+        print_change(&mut removed, &mut added);
         println!();
+    }
+}
+
+fn print_change(removed: &mut Vec<String>, added: &mut Vec<String>) {
+    for line in removed.drain(..).chain(added.drain(..)) {
+        print!("{}", line);
     }
 }
